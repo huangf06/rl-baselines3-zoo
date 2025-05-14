@@ -489,18 +489,79 @@ def sample_ars_params(trial: optuna.Trial, n_actions: int, n_envs: int, addition
     )
 
 
+def sample_bootstrapped_dqn_params(trial: optuna.Trial, n_actions: int, n_envs: int, additional_args: dict) -> dict[str, Any]:
+    """
+    Sampler for Bootstrapped DQN hyperparameters.
+    Aligned with DQN's parameter ranges while maintaining Bootstrapped DQN specific parameters.
+    
+    Args:
+        trial: Optuna trial object
+        n_actions: Number of actions in the environment
+        n_envs: Number of environments
+        additional_args: Additional arguments
+        
+    Returns:
+        Dictionary of hyperparameters
+    """
+    # From 2**5=32 to 2**11=2048 (aligned with DQN)
+    batch_size_pow = trial.suggest_int("batch_size_pow", 5, 11)
+    one_minus_gamma = trial.suggest_float("one_minus_gamma", 0.0001, 0.03, log=True)
+    
+    # Learning rate (aligned with DQN)
+    learning_rate = trial.suggest_float("learning_rate", 1e-5, 0.002, log=True)
+    
+    # Network architecture (aligned with DQN)
+    net_arch = trial.suggest_categorical("net_arch", ["small", "medium", "big"])
+    activation_fn = trial.suggest_categorical("activation_fn", ["tanh", "relu", "elu"])
+    
+    # Bootstrapped DQN specific parameters
+    n_heads = trial.suggest_int("n_heads", 5, 20)
+    bootstrap_prob = trial.suggest_float("bootstrap_prob", 0.3, 0.7)  # Probability of including a transition in a head's training
+    
+    # Training parameters (aligned with DQN)
+    train_freq = trial.suggest_int("train_freq", 1, 10)
+    subsample_steps = trial.suggest_int("subsample_steps", 1, min(train_freq, 8))
+    
+    # Exploration parameters (aligned with DQN)
+    exploration_final_eps = trial.suggest_float("exploration_final_eps", 0, 0.2)
+    exploration_fraction = trial.suggest_float("exploration_fraction", 0, 0.5)
+    target_update_interval = trial.suggest_int("target_update_interval", 1, 20000, log=True)
+    
+    # Display true values
+    trial.set_user_attr("gamma", 1 - one_minus_gamma)
+    trial.set_user_attr("batch_size", 2**batch_size_pow)
+    
+    sampled_params = {
+        "batch_size_pow": batch_size_pow,
+        "one_minus_gamma": one_minus_gamma,
+        "learning_rate": learning_rate,
+        "net_arch": net_arch,
+        "activation_fn": activation_fn,
+        "n_heads": n_heads,
+        "bootstrap_prob": bootstrap_prob,  # Add bootstrap_prob to sampled parameters
+        "train_freq": train_freq,
+        "subsample_steps": subsample_steps,
+        "exploration_fraction": exploration_fraction,
+        "exploration_final_eps": exploration_final_eps,
+        "target_update_interval": target_update_interval,
+    }
+    
+    return convert_offpolicy_params(sampled_params)
+
+
 HYPERPARAMS_SAMPLER = {
     "a2c": sample_a2c_params,
     "ars": sample_ars_params,
     "ddpg": sample_td3_params,
     "dqn": sample_dqn_params,
-    "qrdqn": sample_qrdqn_params,
     "ppo": sample_ppo_params,
     "ppo_lstm": sample_ppo_lstm_params,
     "sac": sample_sac_params,
-    "tqc": sample_tqc_params,
     "td3": sample_td3_params,
+    "tqc": sample_tqc_params,
     "trpo": sample_trpo_params,
+    "qrdqn": sample_qrdqn_params,
+    "bootstrapped_dqn": sample_bootstrapped_dqn_params,
 }
 
 # Convert sampled value to hyperparameters
@@ -509,11 +570,12 @@ HYPERPARAMS_CONVERTER = {
     "ars": convert_ars_params,
     "ddpg": convert_offpolicy_params,
     "dqn": convert_offpolicy_params,
-    "qrdqn": convert_offpolicy_params,
     "ppo": convert_onpolicy_params,
     "ppo_lstm": convert_onpolicy_params,
     "sac": convert_offpolicy_params,
-    "tqc": convert_offpolicy_params,
     "td3": convert_offpolicy_params,
+    "tqc": convert_offpolicy_params,
     "trpo": convert_onpolicy_params,
+    "qrdqn": convert_offpolicy_params,
+    "bootstrapped_dqn": convert_offpolicy_params,
 }

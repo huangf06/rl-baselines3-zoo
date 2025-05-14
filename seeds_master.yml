@@ -1,0 +1,11 @@
+seeds:
+  - {id: 0, value: 101}
+  - {id: 1, value: 307}
+  - {id: 2, value: 911}
+  - {id: 3, value: 1747}
+  - {id: 4, value: 2029}
+  - {id: 5, value: 2861}
+  - {id: 6, value: 3253}
+  - {id: 7, value: 4099}
+  - {id: 8, value: 7919}
+  - {id: 9, value: 9011}

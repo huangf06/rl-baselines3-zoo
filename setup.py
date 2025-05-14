@@ -1,7 +1,7 @@
 import os
 import shutil
 
-from setuptools import setup
+from setuptools import setup, find_packages
 
 with open(os.path.join("rl_zoo3", "version.txt")) as file_handler:
     __version__ = file_handler.read().strip()
@@ -34,44 +34,36 @@ test_requires = [
 ]
 
 setup(
-    name="rl_zoo3",
-    packages=["rl_zoo3", "rl_zoo3.plots"],
-    package_data={
-        "rl_zoo3": [
-            "py.typed",
-            "version.txt",
-            "hyperparams/*.yml",
-        ]
-    },
-    entry_points={"console_scripts": ["rl_zoo3=rl_zoo3.cli:main"]},
-    install_requires=install_requires,
-    extras_require={"plots": plots_requires, "tests": test_requires},
-    description="A Training Framework for Stable Baselines3 Reinforcement Learning Agents",
-    author="Antonin Raffin",
+    name="rl-baselines3-zoo",
+    version="2.0.0",
+    description="A training framework for Stable-Baselines3 with Bootstrapped DQN integration",
+    author="RL Zoo Team",
+    author_email="",
     url="https://github.com/DLR-RM/rl-baselines3-zoo",
-    author_email="antonin.raffin@dlr.de",
-    keywords="reinforcement-learning-algorithms reinforcement-learning machine-learning "
-    "gymnasium openai stable baselines sb3 toolbox python data-science",
-    license="MIT",
-    long_description=long_description,
-    long_description_content_type="text/markdown",
-    version=__version__,
-    python_requires=">=3.9",
-    # PyPI package information.
-    project_urls={
-        "Code": "https://github.com/DLR-RM/rl-baselines3-zoo",
-        "Documentation": "https://rl-baselines3-zoo.readthedocs.io/en/master/",
-        "Changelog": "https://github.com/DLR-RM/rl-baselines3-zoo/blob/master/CHANGELOG.md",
-        "Stable-Baselines3": "https://github.com/DLR-RM/stable-baselines3",
-        "RL-Zoo": "https://github.com/DLR-RM/rl-baselines3-zoo",
-        "SBX": "https://github.com/araffin/sbx",
-    },
+    packages=find_packages(),
+    install_requires=[
+        "gymnasium>=0.28.1",
+        "numpy>=1.21.0",
+        "torch>=1.11.0",
+        "stable-baselines3>=2.0.0",
+        "pyyaml>=5.1.2",
+        "tensorboard>=2.9.1",
+        "rich>=12.0.0",
+        "opencv-python>=4.5.5.64",
+        "matplotlib>=3.5.1",
+        "pandas>=1.4.2",
+        "seaborn>=0.11.2",
+        "cloudpickle>=2.0.1",
+        "optuna>=2.10.0",
+        "sb3-contrib>=2.0.0",
+    ],
+    python_requires=">=3.8",
     classifiers=[
         "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
-        "Programming Language :: Python :: 3.12",
     ],
 )
 

@@ -14,6 +14,8 @@ atari:
   gradient_steps: 4
   exploration_fraction: 0.1
   exploration_final_eps: 0.01
+  n_heads: 10  # Number of bootstrap heads
+  bootstrap_prob: 0.65  # Probability of including a transition in a head's training
   # If True, you need to deactivate handle_timeout_termination
   # in the replay_buffer_kwargs
   optimize_memory_usage: False
@@ -32,6 +34,8 @@ CartPole-v1:
   gradient_steps: 128
   exploration_fraction: 0.16
   exploration_final_eps: 0.04
+  n_heads: 10
+  bootstrap_prob: 0.5
   policy_kwargs: "dict(net_arch=[256, 256])"
 
 # Tuned
@@ -48,6 +52,8 @@ MountainCar-v0:
   gradient_steps: 8
   exploration_fraction: 0.2
   exploration_final_eps: 0.07
+  n_heads: 10
+  bootstrap_prob: 0.5
   policy_kwargs: "dict(net_arch=[256, 256])"
 
 # Tuned
@@ -64,6 +70,8 @@ LunarLander-v2:
   gradient_steps: -1
   exploration_fraction: 0.12
   exploration_final_eps: 0.1
+  n_heads: 10
+  bootstrap_prob: 0.5
   policy_kwargs: "dict(net_arch=[256, 256])"
 
 # Tuned
@@ -80,4 +88,6 @@ Acrobot-v1:
   gradient_steps: -1
   exploration_fraction: 0.12
   exploration_final_eps: 0.1
+  n_heads: 10
+  bootstrap_prob: 0.5
   policy_kwargs: "dict(net_arch=[256, 256])"

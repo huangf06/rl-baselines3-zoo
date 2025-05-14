@@ -23,6 +23,9 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv,
 # For custom activation fn
 from torch import nn as nn
 
+# Import Bootstrapped DQN
+from rl_zoo3.bootstrapped_dqn import BootstrappedDQN
+
 ALGOS: dict[str, type[BaseAlgorithm]] = {
     "a2c": A2C,
     "ddpg": DDPG,
@@ -37,6 +40,8 @@ ALGOS: dict[str, type[BaseAlgorithm]] = {
     "tqc": TQC,
     "trpo": TRPO,
     "ppo_lstm": RecurrentPPO,
+    # Custom algorithms
+    "bootstrapped_dqn": BootstrappedDQN,
 }
 
 
