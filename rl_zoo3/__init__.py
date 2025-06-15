@@ -3,13 +3,14 @@
 import os
 
 # isort: off
-
 import rl_zoo3.gym_patches  # noqa: F401
-
 # isort: on
 
+# Import algorithms first to avoid circular imports
+from rl_zoo3.algos import ALGOS
+
+# Then import utilities
 from rl_zoo3.utils import (
-    ALGOS,
     create_test_env,
     get_latest_run_id,
     get_saved_hyperparams,
@@ -18,14 +19,11 @@ from rl_zoo3.utils import (
     linear_schedule,
 )
 
+# Finally import main functionality
 from rl_zoo3.train import train
 from rl_zoo3.enjoy import enjoy
 from rl_zoo3.load_from_hub import load_from_hub
 from rl_zoo3.exp_manager import ExperimentManager
-
-# Register Bootstrapped DQN
-from rl_zoo3.bootstrapped_dqn import BootstrappedDQN
-ALGOS["bootstrapped_dqn"] = BootstrappedDQN
 
 # Read version from file
 version_file = os.path.join(os.path.dirname(__file__), "version.txt")

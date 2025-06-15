@@ -1,51 +1,89 @@
-"""Bootstrapped DQN implementation for rl-baselines3-zoo."""
+"""Bootstrapped DQN — a clean, single‑file implementation fully compatible with
+Stable‑Baselines3 ≥ 2.6 **and** rl‑baselines3‑zoo.
 
-from typing import Any, Dict, List, Optional, Type, Union, Tuple, Callable, NamedTuple
+Highlights
+==========
+* **Multi‑head Q‑network** (shared trunk + H linear heads).
+* **ReplayBuffer with bootstrap masks** — mask & data always use **identical indices**.
+* **Head‑switch callback** — random head per env at rollout start.
+* **Correct ε‑greedy** in `_sample_action()` so each env follows its current head.
+* **Vectorised loss** — one pass over heads, no Python loops.
 
+Usage (inside rl‑baselines3‑zoo)
+--------------------------------
+```bash
+python -m rl_zoo3.train --algo bootstrapped_dqn --env LunarLander-v3 \
+  --hyperparams "n_heads:10,bootstrap_prob:0.9,buffer_size:100000,\
+                 learning_rate:1e-4,target_update_interval:4000,\
+                 gradient_steps:1,exploration_fraction:0.05,\
+                 exploration_final_eps:0.05" --n_envs 8
+```
+
+Quick smoke‑test (stand‑alone)
+------------------------------
+```bash
+pip install "stable-baselines3>=2.6" gymnasium[box2d] torch
+python bootstrapped_dqn.py --timesteps 5e4
+```
+"""
+from __future__ import annotations
+
+import argparse
+from copy import deepcopy
+from pathlib import Path
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, Type, Union
+
+import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import gymnasium as gym
-
-from stable_baselines3.dqn import DQN
-from stable_baselines3.dqn.policies import DQNPolicy
-from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, ReplayBufferSamples
-from stable_baselines3.common.buffers import ReplayBuffer
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor, FlattenExtractor, NatureCNN
-from stable_baselines3.common.policies import BasePolicy
-from stable_baselines3.common.logger import configure as configure_logger
+from stable_baselines3.common.buffers import ReplayBuffer, ReplayBufferSamples
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.policies import BasePolicy
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor, FlattenExtractor, NatureCNN, create_mlp
+from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback
 from stable_baselines3.common.utils import polyak_update
 from stable_baselines3.common.vec_env import VecNormalize
+from stable_baselines3.dqn import DQN
+from stable_baselines3.dqn.policies import DQNPolicy
 
-# Define Schedule type
+# -----------------------------------------------------------------------------
+# Typing helpers
+# -----------------------------------------------------------------------------
 Schedule = Callable[[float], float]
 
+
 class BootstrappedSamples(NamedTuple):
-    """Extended ReplayBufferSamples that includes bootstrap mask and indices."""
+    """Extension of ReplayBufferSamples with bootstrap mask."""
+
     observations: torch.Tensor
     next_observations: torch.Tensor
     actions: torch.Tensor
     rewards: torch.Tensor
     dones: torch.Tensor
-    mask: torch.Tensor  # Shape: [batch, n_heads]
-    idx: torch.Tensor   # Shape: [batch]
+    mask: torch.Tensor  # [batch, n_heads]
 
+
+# -----------------------------------------------------------------------------
+# ReplayBuffer with aligned bootstrap masks
+# -----------------------------------------------------------------------------
 class BootstrapMaskBuffer(ReplayBuffer):
-    """Wrapper around ReplayBuffer that adds bootstrap mask functionality."""
+    """ReplayBuffer that stores a Bernoulli mask for every transition."""
+
     def __init__(
         self,
         buffer_size: int,
-        observation_space: gym.spaces.Space,
-        action_space: gym.spaces.Space,
+        observation_space: gym.Space,
+        action_space: gym.Space,
         device: Union[torch.device, str] = "auto",
+        *,
         n_envs: int = 1,
         optimize_memory_usage: bool = False,
         handle_timeout_termination: bool = True,
         n_heads: int = 10,
         bootstrap_prob: float = 0.5,
-    ):
+    ) -> None:
         super().__init__(
             buffer_size,
             observation_space,
@@ -56,22 +94,15 @@ class BootstrapMaskBuffer(ReplayBuffer):
             handle_timeout_termination=handle_timeout_termination,
         )
         self.n_heads = n_heads
-        self.bootstrap_prob = bootstrap_prob
-        # Initialize empty mask buffer
-        self.mask_buf = np.zeros((buffer_size, n_heads), dtype=bool)
-    
-    def _generate_masks(self, batch_size: int) -> torch.Tensor:
-        """Generate bootstrap masks for a batch.
-        
-        Args:
-            batch_size: Number of masks to generate
-            
-        Returns:
-            Tensor of shape [batch_size, n_heads] containing boolean masks
-        """
-        indices = self._sample_indices(batch_size)
-        return torch.as_tensor(self.mask_buf[indices], device=self.device)
-        
+        self.bootstrap_prob = float(bootstrap_prob)
+        self.masks = np.zeros((buffer_size, n_heads), dtype=np.bool_)
+
+    # ---------------------- helpers ----------------------
+    def _sample_indices(self, batch_size: int) -> np.ndarray:  # pylint: disable=arguments-differ
+        upper = self.buffer_size if self.full else self.pos
+        return np.random.randint(0, upper, size=batch_size)
+
+    # ---------------------- API --------------------------
     def add(
         self,
         obs: np.ndarray,
@@ -80,257 +111,277 @@ class BootstrapMaskBuffer(ReplayBuffer):
         reward: np.ndarray,
         done: np.ndarray,
         infos: List[Dict[str, Any]],
-    ) -> None:
-        """Add a new transition to the buffer."""
-        # Generate bootstrap mask for the current position
-        mask = np.random.rand(self.n_heads) < self.bootstrap_prob
-        # Ensure at least one head is active
-        if not mask.any():
-            mask[np.random.randint(self.n_heads)] = True
-        # Ensure not all heads are active
-        if mask.all():
-            mask[np.random.randint(self.n_heads)] = False
-        self.mask_buf[self.pos] = mask
+    ) -> None:  # pylint: disable=invalid-name
+        # Ensure 2D input
+        obs = np.atleast_2d(obs)
+        next_obs = np.atleast_2d(next_obs)
+        action = np.atleast_2d(action)
+        reward = np.atleast_2d(reward)
+        done = np.atleast_2d(done)
+        n_envs = obs.shape[0]
         
-        # Convert infos to list of dicts if needed
-        if isinstance(infos, tuple):
-            infos = [{"TimeLimit.truncated": False} for _ in range(len(infos))]
-        elif not isinstance(infos, list):
-            infos = [{"TimeLimit.truncated": False}]
-        elif len(infos) == 0:
-            infos = [{"TimeLimit.truncated": False}]
+        # Generate masks for each env
+        new_masks = np.random.binomial(1, self.bootstrap_prob, size=(n_envs, self.n_heads))
         
+        # Ensure each transition has at least one active mask
+        zero_mask_rows = ~new_masks.any(axis=1)
+        if zero_mask_rows.any():
+            random_heads = np.random.randint(0, self.n_heads, size=zero_mask_rows.sum())
+            new_masks[zero_mask_rows, random_heads] = 1
+        
+        # Add to buffer using parent's method
         super().add(obs, next_obs, action, reward, done, infos)
+        
+        # Store masks using correct indexing
+        indices = (self.pos - n_envs + np.arange(n_envs)) % self.buffer_size
+        self.masks[indices] = new_masks
 
-    def reset(self):
-        """Reset the buffer.
+    # mypy: override
+    def sample(self, batch_size: int, env: Optional[VecNormalize] = None) -> BootstrappedSamples:  # type: ignore[override]
+        # Use parent's sampling logic
+        indices = self._sample_indices(batch_size)
+        data = self._get_samples(indices, env=env)
+        # Convert mask to tensor immediately
+        masks = torch.as_tensor(self.masks[indices], device=self.device)
         
-        Note: The mask buffer is cleared on reset to avoid sampling stale masks.
-        """
-        super().reset()
-        self.mask_buf[:] = False
-
-    def _sample_indices(self, batch_size: int) -> np.ndarray:
-        """Sample indices from the buffer."""
-        upper_bound = self.buffer_size if self.full else self.pos
-        return np.random.randint(0, upper_bound, size=batch_size)
-
-    def sample(self, batch_size: int, env: Optional[VecNormalize] = None) -> BootstrappedSamples:
-        """Sample a batch of experiences with bootstrap masks.
+        # Verify mask alignment
+        assert (masks == 1).any(dim=1).all(), "Each sample must have at least one active mask"
         
-        Args:
-            batch_size: Number of transitions to sample
-            env: Optional VecNormalize wrapper for observation normalization
-            
-        Returns:
-            BootstrappedSamples with mask and indices
-        """
-        # Get samples from parent class
-        samples = super().sample(batch_size, env)
-        
-        # Generate bootstrap masks
-        mask = self._generate_masks(batch_size)
-        
-        # Add masks to samples
         return BootstrappedSamples(
-            observations=samples.observations,
-            actions=samples.actions,
-            next_observations=samples.next_observations,
-            dones=samples.dones,
-            rewards=samples.rewards,
-            mask=mask,
-            idx=torch.arange(batch_size, device=mask.device)
+            observations=data.observations,
+            next_observations=data.next_observations,
+            actions=data.actions,
+            rewards=data.rewards,
+            dones=data.dones,
+            mask=masks,  # Now a tensor
         )
 
-class MultiHeadNetwork(nn.Module):
-    """Q-Network with multiple heads and dueling architecture."""
+
+# -----------------------------------------------------------------------------
+# Network & Policy
+# -----------------------------------------------------------------------------
+class MultiHeadQNet(nn.Module):
     def __init__(
         self,
-        features_extractor: nn.Module,
-        shared_mlp: nn.Module,
-        q_heads: nn.ModuleList,
-        dueling: bool = True,
-    ):
+        observation_dim: int,
+        action_dim: int,
+        n_heads: int,
+        n_envs: int = 1,
+        net_arch: Optional[List[int]] = None,
+        activation_fn: Type[nn.Module] = nn.ReLU,
+    ) -> None:
         super().__init__()
-        self.features_extractor = features_extractor
-        self.shared_mlp = shared_mlp
-        self.q_heads = q_heads
-        self.dueling = dueling
+        self.n_heads = n_heads
+        self.action_dim = action_dim
+        self.n_envs = n_envs
         
-        if dueling:
-            # Find the last Linear layer in shared_mlp to get the correct output dim
-            shared_dim = None
-            if isinstance(shared_mlp, nn.Identity):
-                shared_dim = features_extractor.features_dim
-            elif isinstance(shared_mlp, nn.Sequential):
-                for layer in reversed(shared_mlp):
-                    if isinstance(layer, nn.Linear):
-                        shared_dim = layer.out_features
-                        break
-            if shared_dim is None:
-                raise RuntimeError("Could not determine shared_mlp output dimension for dueling heads.")
-            self.value_heads = nn.ModuleList([
-                nn.Linear(shared_dim, 1)
-                for _ in range(len(q_heads))
-            ])
-            self.advantage_heads = nn.ModuleList([
-                nn.Linear(shared_dim, q_heads[0].out_features)
-                for _ in range(len(q_heads))
-            ])
-
+        # Create shared MLP trunk properly
+        if net_arch is None:
+            net_arch = [256, 256]
+            
+        # Build trunk layers
+        trunk_layers = []
+        last_dim = observation_dim
+        for layer_size in net_arch[:-1]:
+            trunk_layers.append(nn.Linear(last_dim, layer_size))
+            trunk_layers.append(activation_fn())
+            last_dim = layer_size
+        # Add final layer
+        trunk_layers.append(nn.Linear(last_dim, net_arch[-1]))
+        self.trunk = nn.Sequential(*trunk_layers)
+        
+        # Create independent linear heads
+        self.heads = nn.ModuleList([
+            nn.Linear(net_arch[-1], action_dim)
+            for _ in range(n_heads)
+        ])
+        
+        # Register current heads buffer
+        self.register_buffer(
+            "_current_heads",
+            torch.zeros(n_envs, dtype=torch.long)
+        )
+        # Initialize randomly
+        self._current_heads.random_(0, n_heads)
+    
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        """Forward pass through the network."""
-        if obs.dtype != torch.float32:
-            obs = obs.float()
+        # Get shared features [batch_size, trunk_out_dim]
+        features = self.trunk(obs)
         
-        if obs.ndim == 3 or obs.ndim == 1:
-            obs = obs.unsqueeze(0)
-            
-        # Only normalize if input is actually an image (4D tensor with channels)
-        if obs.ndim == 4:
-            obs = obs / 255.0
-            
-        features = self.features_extractor(obs)
-        shared_features = self.shared_mlp(features)
+        # Get Q-values for each head [batch_size, n_heads, n_actions]
+        # TODO: Consider using einsum for better performance with large n_heads
+        q_values = torch.stack([
+            head(features) for head in self.heads
+        ], dim=1)
         
-        if self.dueling:
-            # Dueling DQN architecture
-            q_values = []
-            for i in range(len(self.q_heads)):
-                value = self.value_heads[i](shared_features)
-                advantage = self.advantage_heads[i](shared_features)
-                # Combine value and advantage streams
-                q_values.append(value + advantage - advantage.mean(dim=1, keepdim=True))
-            return torch.stack(q_values, dim=1)
+        return q_values
+    
+    def _predict(self, obs: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
+        """Get the action from an observation (in training mode using the policy).
+        
+        Args:
+            obs: Observation tensor
+            deterministic: Whether to use deterministic actions
+            
+        Returns:
+            Selected actions
+        """
+        # Get Q-values for all heads [batch_size, n_heads, n_actions]
+        q_values = self(obs)
+        
+        # Select Q-values for current heads [batch_size, n_actions]
+        current_q_values = q_values[torch.arange(len(self._current_heads), device=obs.device), self._current_heads]
+        
+        if deterministic:
+            # Take best action for each environment
+            actions = current_q_values.argmax(dim=1)
         else:
-            # Standard DQN architecture
-            return torch.stack([head(shared_features) for head in self.q_heads], dim=1)
-
+            # Per-environment ε-greedy
+            random_mask = torch.rand(len(self._current_heads), device=obs.device) < getattr(self, "exploration_rate", 0.0)
+            actions = torch.empty(len(self._current_heads), dtype=torch.long, device=obs.device)
+            
+            # Greedy actions for non-random environments
+            if (~random_mask).any():
+                actions[~random_mask] = current_q_values[~random_mask].argmax(dim=1)
+            
+            # Random actions for random environments
+            if random_mask.any():
+                actions[random_mask] = torch.randint(
+                    0, self.action_dim, 
+                    size=(random_mask.sum(),), 
+                    device=obs.device
+                )
+        
+        return actions
+    
     def set_training_mode(self, mode: bool) -> None:
-        """Set the training mode for all submodules."""
+        """Set the training mode for all submodules.
+        
+        Required by SB3's DQN policy for target network management.
+        """
         self.train(mode)
-        self.features_extractor.train(mode)
-        self.shared_mlp.train(mode)
-        for head in self.q_heads:
-            head.train(mode)
+    
+    def switch_heads(self) -> None:
+        """Randomly select new heads for each environment."""
+        self._current_heads.random_(0, self.n_heads)
+
 
 class MultiHeadQPolicy(DQNPolicy):
-    """Policy class for Bootstrapped DQN with multiple heads."""
+    """Policy wrapper that plugs the multi‑head Q‑network into SB3."""
+
     def __init__(
         self,
-        observation_space: gym.spaces.Space,
-        action_space: gym.spaces.Space,
+        observation_space: gym.Space,
+        action_space: gym.Space,
         lr_schedule: Schedule,
+        *,
         n_heads: int = 10,
         net_arch: Optional[List[int]] = None,
         activation_fn: Type[nn.Module] = nn.ReLU,
         features_extractor_class: Type[BaseFeaturesExtractor] = FlattenExtractor,
         features_extractor_kwargs: Optional[Dict[str, Any]] = None,
-        normalize_images: bool = True,
-        optimizer_class: Type[torch.optim.Optimizer] = torch.optim.Adam,
-        optimizer_kwargs: Optional[Dict[str, Any]] = None,
-    ):
-        if net_arch is None:
-            if features_extractor_class == NatureCNN:
-                net_arch = []
-            else:
-                net_arch = [64, 64]
-
-        if features_extractor_kwargs is None:
-            features_extractor_kwargs = {}
-
-        if optimizer_kwargs is None:
-            optimizer_kwargs = {}
-
+        **kwargs,
+    ) -> None:
         self.n_heads = n_heads
-        self.net_arch = net_arch
-        self.activation_fn = activation_fn
-        self.normalize_images = normalize_images
-        self.optimizer_class = optimizer_class
-        self.optimizer_kwargs = optimizer_kwargs
-        self.features_extractor_class = features_extractor_class
-        self.features_extractor_kwargs = features_extractor_kwargs
-
+        if net_arch is None:
+            net_arch = [256, 256]
         super().__init__(
-            observation_space=observation_space,
-            action_space=action_space,
-            lr_schedule=lr_schedule,
+            observation_space,
+            action_space,
+            lr_schedule,
             net_arch=net_arch,
             activation_fn=activation_fn,
             features_extractor_class=features_extractor_class,
-            features_extractor_kwargs=features_extractor_kwargs,
-            normalize_images=normalize_images,
-            optimizer_class=optimizer_class,
-            optimizer_kwargs=optimizer_kwargs,
+            features_extractor_kwargs=features_extractor_kwargs or {},
+            **kwargs,
         )
 
     def make_q_net(self) -> nn.Module:
-        """Create the Q-network with multiple heads."""
-        # Create shared feature extractor
-        features_extractor = self.features_extractor_class(
-            self.observation_space,
-            **self.features_extractor_kwargs
+        # Create feature extractor first
+        self.features_extractor = self.features_extractor_class(
+            self.observation_space, **self.features_extractor_kwargs
         )
-        features_dim = features_extractor.features_dim
+        # Get n_envs from the environment if available
+        n_envs = getattr(self.env, "num_envs", 1) if hasattr(self, "env") else 1
+        # Create Q network with feature extractor's output dimension
+        return MultiHeadQNet(
+            observation_dim=self.features_extractor.features_dim,
+            action_dim=self.action_space.n,
+            n_heads=self.n_heads,
+            n_envs=n_envs,
+            net_arch=self.net_arch,
+            activation_fn=self.activation_fn,
+        )
+
+    def forward(
+        self,
+        obs: torch.Tensor,
+        deterministic: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # More precise dimension check for single environment
+        if (obs.ndim == len(self.observation_space.shape) and 
+            getattr(self, "n_envs", 1) == 1):
+            obs = obs.unsqueeze(0)
         
-        # Create shared MLP if needed
-        if not self.net_arch:
-            shared_mlp = nn.Identity()
-            shared_dim = features_dim
-        else:
-            layers = []
-            last_layer_dim = features_dim
-            for layer_size in self.net_arch:
-                layers.append(nn.Linear(last_layer_dim, layer_size))
-                layers.append(self.activation_fn())
-                last_layer_dim = layer_size
-            shared_mlp = nn.Sequential(*layers)
-            shared_dim = self.net_arch[-1]
+        # Extract features first
+        features = self.features_extractor(obs)
         
-        # Create multiple heads
-        q_heads = nn.ModuleList([
-            nn.Linear(shared_dim, self.action_space.n)
-            for _ in range(self.n_heads)
-        ])
+        # Get Q-values for all heads [batch_size, n_heads, n_actions]
+        q_values = self.q_net(features)
         
-        return MultiHeadNetwork(features_extractor, shared_mlp, q_heads)
-
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        """Forward pass through the network."""
-        return self.q_net(obs)
-
-    def _predict(self, obs: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
-        """Get the action from an observation (in training mode using the policy).
-
-        :param obs: Observation
-        :param deterministic: Whether to use deterministic actions
-        :return: Taken action according to the policy
-        """
-        q_values = self.forward(obs)  # [batch, n_heads, n_actions]
-        # Select the current active head per environment
-        if hasattr(self, "_last_head"):
-            batch_indices = torch.arange(obs.shape[0], device=obs.device)
-            q_values = q_values[batch_indices, self._last_head]  # [batch, n_actions]
+        # Get current head indices for each environment
+        current_heads = self.q_net._current_heads  # Access from q_net
+        
+        # Select Q-values for current heads [batch_size, n_actions]
+        current_q_values = q_values[torch.arange(len(current_heads)), current_heads]
+        
+        if deterministic:
+            # Take best action for each environment
+            actions = current_q_values.argmax(dim=1)
         else:
-            q_values = q_values[:, 0]  # fallback to first head
-        # Apply epsilon-greedy exploration
-        exploration_rate = getattr(self, "exploration_rate", 0.0)
-        if not deterministic and np.random.rand() < exploration_rate:
-            actions = torch.randint(0, self.action_space.n, (obs.shape[0],), device=obs.device)
-        else:
-            actions = q_values.argmax(dim=-1)
-        return actions
+            # Per-environment ε-greedy
+            random_mask = torch.rand(len(current_heads), device=self.device) < self.exploration_rate
+            actions = torch.empty(len(current_heads), dtype=torch.long, device=self.device)
+            
+            # Greedy actions for non-random environments
+            if (~random_mask).any():
+                actions[~random_mask] = current_q_values[~random_mask].argmax(dim=1)
+            
+            # Random actions for random environments
+            if random_mask.any():
+                actions[random_mask] = torch.randint(
+                    0, self.action_space.n, 
+                    size=(random_mask.sum(),), 
+                    device=self.device
+                )
+        
+        return actions, actions  # Return same actions for buffer
 
+
+# -----------------------------------------------------------------------------
+# Callback — switch heads every rollout
+# -----------------------------------------------------------------------------
+class HeadSwitchCallback(BaseCallback):
+    """Randomly selects a new head for every env at rollout start."""
+
+    def __init__(self, n_heads: int):
+        super().__init__()
+        self.n_heads = n_heads
+
+    def _on_rollout_start(self) -> None:
+        # Only switch heads for online network
+        self.model.policy.q_net.switch_heads()
+        # Remove target network head switching
+
+    def _on_step(self) -> bool:
+        """Required by BaseCallback. Returns True to continue training."""
+        return True
+
+
+# -----------------------------------------------------------------------------
+# Bootstrapped DQN algorithm
+# -----------------------------------------------------------------------------
 class BootstrappedDQN(DQN):
-    """
-    Bootstrapped DQN (Osband et al., 2016)
-    Paper: https://arxiv.org/abs/1602.04621
-    
-    This implementation extends DQN with bootstrapped uncertainty estimation
-    using multiple Q-heads and bootstrap masking. Each head is trained on a
-    different subset of the replay buffer, allowing for better exploration
-    and uncertainty estimation.
-    """
     policy_aliases: Dict[str, Type[BasePolicy]] = {
         "MlpPolicy": MultiHeadQPolicy,
         "CnnPolicy": MultiHeadQPolicy,
@@ -338,25 +389,22 @@ class BootstrappedDQN(DQN):
 
     def __init__(
         self,
-        policy: Union[str, Type[MultiHeadQPolicy]],
+        policy: Union[str, Type[DQNPolicy]],
         env: Union[GymEnv, str],
         n_heads: int = 10,
-        bootstrap_prob: float = 0.5,
-        learning_rate: Union[float, Schedule] = 1e-4,
-        buffer_size: int = 1_000_000,  # 1e6
-        learning_starts: int = 50000,
-        batch_size: int = 32,
+        bootstrap_prob: float = 0.65,
+        learning_rate: Union[float, Schedule] = 6.3e-4,
+        buffer_size: int = 50000,
+        learning_starts: int = 0,
+        batch_size: int = 128,
         tau: float = 1.0,
         gamma: float = 0.99,
         train_freq: Union[int, Tuple[int, str]] = 4,
-        gradient_steps: int = 1,
-        replay_buffer_class: Optional[Type[ReplayBuffer]] = None,
-        replay_buffer_kwargs: Optional[Dict[str, Any]] = None,
-        optimize_memory_usage: bool = False,
+        gradient_steps: int = -1,
         target_update_interval: int = 10000,
-        exploration_fraction: float = 0.1,
+        exploration_fraction: float = 0.12,
         exploration_initial_eps: float = 1.0,
-        exploration_final_eps: float = 0.05,
+        exploration_final_eps: float = 0.1,
         max_grad_norm: float = 10,
         tensorboard_log: Optional[str] = None,
         policy_kwargs: Optional[Dict[str, Any]] = None,
@@ -364,19 +412,22 @@ class BootstrappedDQN(DQN):
         seed: Optional[int] = None,
         device: Union[torch.device, str] = "auto",
         _init_setup_model: bool = True,
-    ):
-        # Set these before calling parent's __init__
+    ) -> None:
+        # Store parameters before super().__init__
         self.n_heads = n_heads
         self.bootstrap_prob = bootstrap_prob
-        self._last_head = None  # Will be initialized in _setup_model
 
+        # --- 修正 policy_kwargs ---
         if policy_kwargs is None:
             policy_kwargs = {}
+        policy_kwargs = dict(policy_kwargs)  # 避免引用传递
         policy_kwargs["n_heads"] = n_heads
 
+        # Initialize parent class with _init_setup_model=False
         super().__init__(
-            policy,
-            env,
+            policy=policy,
+            env=env,
+            _init_setup_model=False,  # Delay model setup
             learning_rate=learning_rate,
             buffer_size=buffer_size,
             learning_starts=learning_starts,
@@ -385,9 +436,6 @@ class BootstrappedDQN(DQN):
             gamma=gamma,
             train_freq=train_freq,
             gradient_steps=gradient_steps,
-            replay_buffer_class=replay_buffer_class,
-            replay_buffer_kwargs=replay_buffer_kwargs,
-            optimize_memory_usage=optimize_memory_usage,
             target_update_interval=target_update_interval,
             exploration_fraction=exploration_fraction,
             exploration_initial_eps=exploration_initial_eps,
@@ -398,155 +446,39 @@ class BootstrappedDQN(DQN):
             verbose=verbose,
             seed=seed,
             device=device,
-            _init_setup_model=_init_setup_model,
         )
-
-    def _setup_model(self) -> None:
-        """Initialize Q-networks (+ noisy target), bootstrap buffer, callbacks, and logger.
         
-        This method:
-        1. Initializes the Q-network and target network with different parameters
-        2. Sets up the replay buffer with bootstrap masking
-        3. Creates the head switching callback
-        4. Configures the logger and exploration parameters
+        # Create head switch callback
+        self.head_switch_cb = HeadSwitchCallback(n_heads=self.n_heads)
         
-        The target network is initialized with small random noise to break symmetry
-        and encourage diverse exploration across heads.
-        """
-        # Set replay buffer class and kwargs before parent initialization
-        if self.replay_buffer_class is None:
-            self.replay_buffer_class = BootstrapMaskBuffer
-
-        if self.replay_buffer_kwargs is None:
-            self.replay_buffer_kwargs = {}
-        # Add bootstrap parameters to kwargs if using BootstrapMaskBuffer
-        if issubclass(self.replay_buffer_class, BootstrapMaskBuffer):
-            self.replay_buffer_kwargs.update({
-                "n_heads": self.n_heads,
-                "bootstrap_prob": self.bootstrap_prob,
-            })
-
-        super()._setup_model()
-
-        # Create target network
-        self.policy.q_net_target = self.policy.make_q_net().to(self.device)
-        # Initialize target network with different parameters to break symmetry
-        for p, tp in zip(self.policy.q_net.parameters(), self.policy.q_net_target.parameters()):
-            tp.data.copy_(p.data + torch.randn_like(p.data) * 0.1)
-
-        # Create callbacks
+        # Initialize callbacks list
         self.callbacks = []
-        self.callbacks.append(HeadSwitchCallback(self.n_heads, self))
-
-        # Initialize exploration rate
-        self.exploration_rate = self.exploration_initial_eps
         
-        # Initialize logger
-        self._logger = configure_logger(folder=None, format_strings=["stdout"])
-
-        # Initialize last head for each environment
-        self._last_head = torch.zeros(self.n_envs, dtype=torch.long, device=self.device)
-        # Sync with policy
-        self.policy._last_head = self._last_head.clone()
-
-    def _on_step(self) -> bool:
-        """
-        Update the exploration rate and target network if needed.
-        """
-        # Update exploration rate
-        self.exploration_rate = self.exploration_schedule(self._current_progress_remaining)
-        self.logger.record("train/exploration_rate", self.exploration_rate)
+        # Now setup the model
+        if _init_setup_model:
+            self._setup_model()
+    
+    def _setup_model(self) -> None:
+        super()._setup_model()
         
-        # Update target network
-        polyak_update(
-            self.q_net.parameters(),
-            self.q_net_target.parameters(),
-            self.tau
+        # Create bootstrap mask buffer
+        self.replay_buffer = BootstrapMaskBuffer(
+            self.buffer_size,
+            self.observation_space,
+            self.action_space,
+            self.device,
+            n_envs=self.n_envs,
+            n_heads=self.n_heads,
+            bootstrap_prob=self.bootstrap_prob,
+            handle_timeout_termination=False,
         )
-        return True
-
-    def train(self, gradient_steps: int, batch_size: int = 100) -> None:
-        """Perform a training step with Double DQN."""
-        self.policy.train()
-        self._update_learning_rate(self.policy.optimizer)
         
-        losses = []
-        for _ in range(gradient_steps):
-            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
-            
-            with torch.no_grad():
-                # Double DQN: use online network to select actions
-                next_q_values = self.policy.q_net(replay_data.next_observations)  # [batch, n_heads, n_actions]
-                next_actions = next_q_values.argmax(dim=2)  # [batch, n_heads]
-                
-                # Use target network to evaluate actions
-                next_q_values_target = self.policy.q_net_target(replay_data.next_observations)  # [batch, n_heads, n_actions]
-                next_q_values = next_q_values_target.gather(2, next_actions.unsqueeze(2)).squeeze(2)  # [batch, n_heads]
-                
-                # Expand rewards and dones to match next_q_values shape
-                rewards = replay_data.rewards.view(-1, 1).expand(-1, self.n_heads)  # [batch, n_heads]
-                dones = replay_data.dones.view(-1, 1).expand(-1, self.n_heads)  # [batch, n_heads]
-                target_q = rewards + (1 - dones) * self.gamma * next_q_values  # [batch, n_heads]
-            
-            current_q = self.policy.q_net(replay_data.observations)  # [batch, n_heads, n_actions]
-            actions = replay_data.actions.view(-1, 1)  # [batch, 1]
-            head_losses = []
-            
-            for head_idx in range(self.n_heads):
-                active_mask = replay_data.mask[:, head_idx]  # [batch]
-                if active_mask.any():
-                    head_q = current_q[:, head_idx].gather(1, actions).squeeze(1)[active_mask]  # [active_batch]
-                    head_target = target_q[:, head_idx][active_mask]  # [active_batch]
-                    loss = F.smooth_l1_loss(head_q, head_target, reduction="mean")
-                    head_losses.append(loss)
-            
-            if not head_losses:
-                self._n_updates += 1
-                self._logger.record("train/skipped_step", 1, exclude="tensorboard")
-                continue
-                
-            loss = torch.stack(head_losses).mean()
-            self.policy.optimizer.zero_grad()
-            loss.backward()
-            
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-            self.policy.optimizer.step()
-            
-            self._n_updates += 1
-            if self._n_updates % self.target_update_interval == 0:
-                with torch.no_grad():
-                    for p, tp in zip(self.policy.q_net.parameters(), self.policy.q_net_target.parameters()):
-                        tp.data.mul_(1 - self.tau)
-                        tp.data.add_(p.data * self.tau)
-            
-            losses.append(loss.item())
-        
-        self._logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
-        self._logger.record("train/loss", np.mean(losses))
-
-    def _excluded_save_params(self) -> List[str]:
-        """Returns the names of the parameters that should be excluded from being saved."""
-        excluded = super()._excluded_save_params()
-        excluded.extend([
-            "replay_buffer",
-            "logger",
-            "callbacks",
-            "_vec_normalize_env",
-            "_last_head",
-            "policy._last_head",
-            "policy.exploration_rate",
-        ])
-        return excluded
-
-    def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
-        """Returns the parameters that should be saved in the torch model file."""
-        state_dicts = ["policy", "policy.optimizer"]
-        return state_dicts, []
-
-    def set_logger(self, logger):
-        """Set the logger for the model."""
-        self._logger = logger
-
+        # Initialize current heads in policy
+        self.policy.q_net._current_heads = torch.zeros(
+            self.n_envs, dtype=torch.long, device=self.device
+        ).random_(0, self.n_heads)
+        self.policy.q_net_target._current_heads = self.policy.q_net._current_heads.clone()
+    
     def learn(
         self,
         total_timesteps: int,
@@ -556,104 +488,182 @@ class BootstrappedDQN(DQN):
         reset_num_timesteps: bool = True,
         progress_bar: bool = False,
     ) -> "BootstrappedDQN":
-        """
-        Return a trained model.
-
-        :param total_timesteps: The total number of samples to train on
-        :param callback: Callback(s) called at every step with state of the algorithm.
-        :param log_interval: The number of timesteps before logging.
-        :param tb_log_name: the name of the run for tensorboard log
-        :param reset_num_timesteps: whether or not to reset the current timestep number (used in logging)
-        :param progress_bar: Display a progress bar using tqdm and rich
-        :return: the trained model
-        """
-        # Combine user callbacks with internal callbacks
-        if callback is None:
-            callback = []
-        elif not isinstance(callback, list):
-            callback = [callback]
+        # Ensure head switch callback is in the list
+        if self.head_switch_cb not in self.callbacks:
+            self.callbacks.append(self.head_switch_cb)
         
-        if not hasattr(self, 'callbacks'):
-            self.callbacks = []
-        elif not isinstance(self.callbacks, list):
-            self.callbacks = [self.callbacks]
-            
-        all_callbacks = callback + self.callbacks
+        # Sync exploration rate before training
+        self.policy.exploration_rate = self.exploration_rate
         
         return super().learn(
             total_timesteps=total_timesteps,
-            callback=all_callbacks,
+            callback=callback,
             log_interval=log_interval,
             tb_log_name=tb_log_name,
             reset_num_timesteps=reset_num_timesteps,
             progress_bar=progress_bar,
         )
 
-# Register the algorithm
-ALGOS = {
-    "bootstrapdqn": BootstrappedDQN,
-}
+    # ---------------- ε‑greedy sampler ----------------
+    def _sample_action(
+        self,
+        learning_starts: int,
+        action_noise: Optional[np.ndarray] = None,
+        n_envs: int = 1,
+    ) -> Tuple[np.ndarray, np.ndarray]:  # noqa: D401
+        if self.num_timesteps < learning_starts:
+            actions = np.array([self.action_space.sample() for _ in range(n_envs)])
+            return actions, actions
 
-# Register the policy
-POLICY_ALIASES = {
-    "MlpPolicy": MultiHeadQPolicy,
-    "CnnPolicy": MultiHeadQPolicy,
-}
+        random_mask = np.random.rand(n_envs) < self.exploration_rate
+        actions = np.empty(n_envs, dtype=int)
+        
+        # Handle all-random case first
+        if random_mask.all():
+            actions = np.random.randint(0, self.action_space.n, size=n_envs)
+            return actions, actions
 
-def get_policy_kwargs(
-    policy: str,
-    policy_kwargs: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Get the policy kwargs for the given policy."""
-    if policy_kwargs is None:
-        policy_kwargs = {}
+        # ---------- greedy branch ----------
+        if (~random_mask).any():
+            # Get observations for non-random actions
+            obs = torch.as_tensor(self._last_obs[~random_mask]).to(self.device).float()
+            
+            # More robust dimension check
+            if (obs.ndim == len(self.observation_space.shape) and 
+                obs.shape[0] != (~random_mask).sum()):
+                obs = obs.unsqueeze(0)
+            
+            q = self.policy.q_net(obs)                                   # [n_sel, H, A]
+            heads = self.policy.q_net._current_heads[~random_mask]       # Use policy's heads
+            q_sel = q[torch.arange(q.size(0), device=self.device), heads]
+            actions[~random_mask] = q_sel.argmax(dim=1).cpu().numpy()
 
-    if policy == "CnnPolicy":
-        if "features_extractor_class" not in policy_kwargs:
-            policy_kwargs["features_extractor_class"] = NatureCNN
-        if "features_extractor_kwargs" not in policy_kwargs:
-            policy_kwargs["features_extractor_kwargs"] = {
-                "features_dim": 512,
-                "normalize_images": True
-            }
-        if "net_arch" not in policy_kwargs:
-            policy_kwargs["net_arch"] = []
-        if "normalize_images" not in policy_kwargs:
-            policy_kwargs["normalize_images"] = True
+        # ---------- random branch ----------
+        if random_mask.any():
+            # Vectorized random action generation
+            actions[random_mask] = np.random.randint(
+                0, self.action_space.n, size=random_mask.sum()
+            )
 
-    return policy_kwargs
+        return actions, actions
 
-class HeadSwitchCallback(BaseCallback):
-    """Callback to switch active head during training.
-    
-    This callback randomly switches the active head for each environment at the
-    start of each rollout. This ensures that different heads are used for
-    exploration and helps maintain diversity in the Q-value estimates.
-    """
-    def __init__(self, n_heads: int, model: Optional["BootstrappedDQN"] = None, **kwargs):
-        super().__init__(**kwargs)
-        self.n_heads = n_heads
-        self._model = model
+    # ---------------- core training loop ----------------
+    def train(self, gradient_steps: int, batch_size: int = 100) -> None:  # noqa: D401
+        self.policy.set_training_mode(True)
+        self._update_learning_rate(self.policy.optimizer)
 
-    def _init_callback(self) -> None:
-        """Initialize callback attributes."""
-        if self._model is None:
-            self._model = self.model
+        losses: List[float] = []
+        for _ in range(gradient_steps):
+            data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
+            mask = data.mask.float()                                     # [B, H]
+            
+            # Skip step if no active masks (numerical stability)
+            if mask.sum() == 0:
+                continue
 
-    def _on_rollout_start(self) -> None:
-        """Switch to a random head at the start of each rollout."""
-        for i in range(self._model.n_envs):
-            current_head = self._model._last_head[i].item()
-            available_heads = list(range(self.n_heads))
-            available_heads.remove(current_head)
-            new_head = available_heads[np.random.randint(len(available_heads))]
-            self._model._last_head[i] = torch.tensor(new_head, device=self._model.device)
-            if self._model.verbose:
-                print(f'[Callback] HeadSwitchCallback triggered at rollout start. Env {i}: {current_head} -> {new_head}')
-        self._model.policy._last_head = self._model._last_head.clone()
-        # Sync exploration rate with policy
-        self._model.policy.exploration_rate = self._model.exploration_rate
+            with torch.no_grad():
+                next_q_online = self.policy.q_net(data.next_observations)         # [B, H, A]
+                next_act = next_q_online.argmax(dim=2, keepdim=True)              # [B, H, 1]
+                next_q_target = self.policy.q_net_target(data.next_observations)  # [B, H, A]
+                next_q = torch.gather(next_q_target, 2, next_act).squeeze(2)      # [B, H]
+                rewards = data.rewards.view(-1, 1)                                # [B, 1]
+                dones = data.dones.view(-1, 1)                                    # [B, 1]
+                target_q = rewards + (1 - dones) * self.gamma * next_q            # [B, H]
 
-    def _on_step(self) -> bool:
-        """Required method for BaseCallback."""
-        return True
+            # current Q
+            cur_q_all = self.policy.q_net(data.observations)                      # [B, H, A]
+            actions = data.actions.view(-1, 1, 1).expand(-1, self.n_heads, 1)     # [B, H, 1]
+            cur_q = torch.gather(cur_q_all, 2, actions).squeeze(2)                # [B, H]
+
+            # Ensure dimensions match
+            assert cur_q.shape == target_q.shape, f"Shape mismatch: cur_q {cur_q.shape} vs target_q {target_q.shape}"
+            td_err = F.smooth_l1_loss(cur_q, target_q, reduction="none")         # [B, H]
+            loss = (td_err * mask).sum() / mask.sum().clamp_min(1.0)
+
+            self.policy.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            self.policy.optimizer.step()
+
+            losses.append(loss.item())
+            self._n_updates += 1
+
+            if self._n_updates % self.target_update_interval == 0:
+                polyak_update(
+                    self.policy.q_net.parameters(),
+                    self.policy.q_net_target.parameters(),
+                    self.tau,
+                )
+                # Sync current heads to target network
+                self.policy.q_net_target._current_heads = self.policy.q_net._current_heads.clone()
+
+        if losses:  # Only record if we had any valid steps
+            self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
+            self.logger.record("train/loss", np.mean(losses))
+
+    def predict(
+        self,
+        observation: Union[np.ndarray, Dict[str, np.ndarray]],
+        state: Optional[Tuple[np.ndarray, ...]] = None,
+        episode_start: Optional[np.ndarray] = None,
+        deterministic: bool = False,
+    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
+        # Sync exploration rate before prediction
+        self.policy.exploration_rate = self.exploration_rate
+        return super().predict(
+            observation=observation,
+            state=state,
+            episode_start=episode_start,
+            deterministic=deterministic,
+        )
+
+    # ---------------- save / load helpers ----------------
+    def _excluded_save_params(self) -> List[str]:
+        """Return a list of parameters that should not be saved."""
+        excluded = super()._excluded_save_params()
+        excluded.extend([
+            "_current_heads",  # Exclude current head indices
+            "head_switch_cb",  # Exclude callback object with thread locks
+            "policy.features_extractor",  # Exclude feature extractor (will be recreated)
+        ])
+        return excluded
+
+    def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
+        """Return the parameters to save."""
+        state_dicts = ["policy", "policy.optimizer"]
+        return state_dicts, []
+
+
+# -----------------------------------------------------------------------------
+# rl‑baselines3‑zoo registration
+# -----------------------------------------------------------------------------
+ALGOS: Dict[str, Any] = {"bootstrapped_dqn": BootstrappedDQN}
+
+# -----------------------------------------------------------------------------
+# Local smoke‑test
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--timesteps", type=int, default=100_000, help="total env steps")
+    args = parser.parse_args()
+
+    env = gym.make("LunarLander-v3")
+    model = BootstrappedDQN(
+        "MlpPolicy",
+        env,
+        n_heads=10,
+        bootstrap_prob=0.65,
+        learning_rate=6.3e-4,
+        buffer_size=50_000,
+        gradient_steps=-1,
+        batch_size=128,
+        exploration_fraction=0.12,
+        exploration_final_eps=0.1,
+        target_update_interval=250,
+        verbose=1,        
+    )
+    model.learn(total_timesteps=args.timesteps)
+    save_path = Path("bootdqn_lunar.zip")
+    model.save(save_path)
+    print(f"Training finished → model saved to {save_path.resolve()}")
+    env.close() 

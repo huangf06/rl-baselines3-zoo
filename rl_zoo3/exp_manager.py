@@ -653,7 +653,8 @@ class ExperimentManager:
         ):  # do not overwrite custom kwargs
             self.monitor_kwargs = dict(info_keywords=("is_success",))
 
-        spec = gym.spec(self.env_name.gym_id)
+        env_id = self.env_name.gym_id
+        spec = gym.spec(env_id)
 
         # Define make_env here, so it works with subprocesses
         # when the registry was modified with `--gym-packages`

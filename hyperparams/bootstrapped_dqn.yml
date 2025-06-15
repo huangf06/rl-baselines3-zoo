@@ -14,11 +14,12 @@ atari:
   gradient_steps: 4
   exploration_fraction: 0.1
   exploration_final_eps: 0.01
-  n_heads: 10  # Number of bootstrap heads
-  bootstrap_prob: 0.65  # Probability of including a transition in a head's training
   # If True, you need to deactivate handle_timeout_termination
   # in the replay_buffer_kwargs
   optimize_memory_usage: False
+  n_heads: 10
+  bootstrap_prob: 0.5
+  policy_kwargs: "dict(net_arch=[256, 256])"
 
 # Almost Tuned
 CartPole-v1:
@@ -72,6 +73,23 @@ LunarLander-v2:
   exploration_final_eps: 0.1
   n_heads: 10
   bootstrap_prob: 0.5
+  policy_kwargs: "dict(net_arch=[256, 256])"
+
+LunarLander-v3:
+  n_timesteps: !!float 1e5
+  policy: 'MlpPolicy'
+  learning_rate: !!float 6.3e-4
+  batch_size: 128
+  buffer_size: 50000
+  learning_starts: 0
+  gamma: 0.99
+  target_update_interval: 250
+  train_freq: 4
+  gradient_steps: -1
+  exploration_fraction: 0.12
+  exploration_final_eps: 0.1
+  n_heads: 10
+  bootstrap_prob: 0.65
   policy_kwargs: "dict(net_arch=[256, 256])"
 
 # Tuned

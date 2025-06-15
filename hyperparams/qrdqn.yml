@@ -58,6 +58,22 @@ LunarLander-v2:
   exploration_final_eps: 0.18
   policy_kwargs: "dict(net_arch=[256, 256], n_quantiles=170)"
 
+LunarLander-v3:
+  n_timesteps: !!float 1e5
+  n_envs: 8
+  policy: 'MlpPolicy'
+  learning_rate: lin_1.5e-3
+  batch_size: 128
+  buffer_size: 100000
+  learning_starts: 10000
+  gamma: 0.995
+  target_update_interval: 1
+  train_freq: 256
+  gradient_steps: -1
+  exploration_fraction: 0.24
+  exploration_final_eps: 0.18
+  policy_kwargs: "dict(net_arch=[256, 256], n_quantiles=170)"
+
 # Tuned
 Acrobot-v1:
   n_timesteps: !!float 1e5
